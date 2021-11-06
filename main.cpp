@@ -28,12 +28,19 @@
 
 /* SETTINGS */
 #define MAX_ONTIME 200 // In uS
-#define MAX_FREQ 500 // In Hz
+#define MIN_PERIOD 2000 // In uS
 
 /* VARIABLES */
 uint8_t noteVelocities[128] = {0};
-double transpose = 0; // number of octives to transpose up by
 volatile bool enableOut = false;
+volatile uint16_t periodOut = 0xFFFF;
+volatile uint16_t ontimeOut = 0;
+
+/* MIDI TUNING CONSTANTS */
+// In uS based on a4=440Hz
+const uint32_t MIDI_PERIOD[128] = {122312,115447,108968,102852,97079,91631,86488,81634,77052,72727,68645,64793,61156,57724,54484,51426,48540,45815,43244,40817,38526,36364,34323,32396,30578,28862,27242,25713,24270,22908,21622,20408,19263,18182,17161,16198,15289,14431,13621,12856,12135,11454,10811,10204,9631,9091,8581,8099,7645,7215,6810,6428,6067,5727,5405,5102,4816,4545,4290,4050,3822,3608,3405,3214,3034,2863,2703,2551,2408,2273,2145,2025,1911,1804,1703,1607,1517,1432,1351,1276,1204,1136,1073,1012,956,902,851,804,758,716,676,638,602,568,536,506,478,451,426,402,379,358,338,319,301,284,268,253,239,225,213,201,190,179,169,159,150,142,134,127,119,113,106,100,95,89,84,80};
+// 0-1023
+const uint16_t MIDI_ONTIME[128] = {0,91,128,157,182,203,222,240,257,272,287,301,314,327,340,352,363,374,385,396,406,416,426,435,445,454,463,472,480,489,497,505,514,521,529,537,545,552,560,567,574,581,588,595,602,609,616,622,629,635,642,648,655,661,667,673,679,685,691,697,703,709,715,721,726,732,737,743,749,754,759,765,770,776,781,786,791,797,802,807,812,817,822,827,832,837,842,847,852,856,861,866,871,875,880,885,889,894,899,903,908,912,917,921,926,930,935,939,943,948,952,956,961,965,969,973,978,982,986,990,994,999,1003,1007,1011,1015,1019,1023};
 
 /* ADC HELPER FUNCTIONS */
 void initAdc() {
@@ -72,14 +79,10 @@ void midiMode() {
             gotMessage = true;
             switch (message.type) {
               case Midi::NOTE_ON:
-                if (message.channel==0) {
-                    noteVelocities[message.pitch] = message.velocity;
-                }                
+                noteVelocities[message.pitch] = message.velocity;              
               break;
               case Midi::NOTE_OFF:
-                if (message.channel==0) {
-                    noteVelocities[message.pitch] = 0;
-                } 
+                noteVelocities[message.pitch] = 0;
               break;
               case Midi::STOP:
               case Midi::RESET:
@@ -102,35 +105,32 @@ void midiMode() {
         uint16_t pitch = readAdc(PITCH_PIN);
 
         // Transpose
-        int a4Frequency;
+        uint8_t transpose;
         if (pitch < 256) {
-            a4Frequency = 55;
+            transpose = 8;
         } else if (pitch < 512) {
-            a4Frequency = 110;
+             transpose = 4;
         } else if (pitch < 768) {
-            a4Frequency = 220;
+             transpose = 2;
         } else {
-            a4Frequency = 440;
+             transpose = 1;
         }
 
         // Find melody frequency
         int8_t upperPitch = 127;
-        while (noteVelocities[upperPitch]==0 && upperPitch>=0) {
+        while ((noteVelocities[upperPitch]==0 || MIDI_PERIOD[upperPitch]*transpose < MIN_PERIOD) && upperPitch>=0 ) {
             upperPitch--;
         }
-        enableOut = velocity>50 && upperPitch >= 0 && pow(2.0, (upperPitch-69)/12.0)*a4Frequency - 1 <= MAX_FREQ;
+        enableOut = velocity>10 && upperPitch >= 0;
         
         if (enableOut) {
-            OCR1A = F_CPU/64/(pow(2.0, (upperPitch-69)/12.0)*a4Frequency) - 1;
-            OCR1B = sqrt(noteVelocities[upperPitch]/127.0)*MAX_ONTIME*velocity/973.0/(64*1000000/F_CPU);
+            periodOut = MIDI_PERIOD[upperPitch]*transpose;
+            ontimeOut = ((uint32_t)MIDI_ONTIME[noteVelocities[upperPitch]]*(velocity-10)*MAX_ONTIME)/1023/1013;
             TIMSK1 = _BV(OCIE1A) | _BV(OCIE1B);
-            if(TCNT1>OCR1A) {
-                TCNT1 = 0;
-                PORTD |= _BV(OUT_PIN);
-            }
-        }  
+        } 
     }
 }
+
 
 /* MANUAL MODE INTERRUPTER */
 void manualMode() {
@@ -149,16 +149,11 @@ void manualMode() {
         uint16_t velocity = readAdc(VELOCITY_PIN);
         uint16_t pitch = readAdc(PITCH_PIN);
 
-        enableOut = velocity>50;
+        enableOut = velocity>10;
         if (enableOut) {
-            enableOut = true;
-            OCR1A = F_CPU/64/(pitch/1023.0*MAX_FREQ) - 1;
-            OCR1B = (velocity-50)/973.0*MAX_ONTIME/(64*1000000/F_CPU);
+            periodOut = MIN_PERIOD*1023UL/pitch - 1;
+            ontimeOut = MAX_ONTIME*(velocity-10UL)/1013;
             TIMSK1 = _BV(OCIE1A) | _BV(OCIE1B);
-            if(TCNT1>OCR1A) {
-                TCNT1 = 0;
-                PORTD |= _BV(OUT_PIN);
-            }
         }
     }
 }
@@ -167,11 +162,12 @@ void manualMode() {
 ISR(TIMER1_COMPB_vect) {
     PORTD &= ~_BV(OUT_PIN);
     if (!enableOut) TIMSK1 = 0;
-    //TODO - Here would be a good place to set OCR1A, OCR1B...
+    OCR1A = F_CPU/1000000UL*periodOut/64;
+    OCR1B = F_CPU/1000000UL*ontimeOut/64;
 }
 
 ISR(TIMER1_COMPA_vect) {
-    PORTD |= _BV(OUT_PIN);     
+    PORTD |= _BV(OUT_PIN);
 }
 
 

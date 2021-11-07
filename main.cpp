@@ -1,21 +1,23 @@
-/* V1-1 Interrupter Firmware
+/* V0-2 Interrupter Firmware
 
  To compile and upload:
-  - avr-g++ -mmcu=atmega328p -Wall -o main.elf main.cpp midi.cpp midi.h -O
+  - avr-g++ -mmcu=atmega328p -Wall -o main.elf *.cpp *.h -O
   - avr-objcopy -j .text -j .data -O ihex main.elf main.hex
   - avrdude -c avrispmkii -p atmega328p -U flash:w:main.hex -P usb
+
+  avr-g++ -mmcu=atmega328p -Wall -o main.elf *.cpp *.h -O; avr-objcopy -j .text -j .data -O ihex main.elf main.hex; avrdude -c avrispmkii -p atmega328p -U flash:w:main.hex -P usb
  
 */
 
 #define F_CPU 16000000UL
 
+#include "adc.h"
+#include "output.h"
 #include "midi.h"
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
-#include <stdint.h>
-#include <math.h>
 #include <avr/sleep.h>
 
 /* ATMEGA328P PINOUT */
@@ -42,53 +44,31 @@ const uint32_t MIDI_PERIOD[128] = {122312,115447,108968,102852,97079,91631,86488
 // 0-1023
 const uint16_t MIDI_ONTIME[128] = {0,91,128,157,182,203,222,240,257,272,287,301,314,327,340,352,363,374,385,396,406,416,426,435,445,454,463,472,480,489,497,505,514,521,529,537,545,552,560,567,574,581,588,595,602,609,616,622,629,635,642,648,655,661,667,673,679,685,691,697,703,709,715,721,726,732,737,743,749,754,759,765,770,776,781,786,791,797,802,807,812,817,822,827,832,837,842,847,852,856,861,866,871,875,880,885,889,894,899,903,908,912,917,921,926,930,935,939,943,948,952,956,961,965,969,973,978,982,986,990,994,999,1003,1007,1011,1015,1019,1023};
 
-/* ADC HELPER FUNCTIONS */
-void initAdc() {
-    // Configure ADC
-    ADCSRA = _BV(ADEN) | _BV(ADPS0) | _BV(ADPS1) | _BV(ADPS2);
-}
-
-uint16_t readAdc(uint8_t pin) {
-    ADMUX = _BV(REFS0) | pin; // Select ADC
-    ADCSRA |= _BV(ADSC); // Start conversion
-    loop_until_bit_is_clear(ADCSRA, ADSC);
-    return ADC; // Get result
-}
-
 /* MIDI MODE INTERRUPTER */
 void midiMode() {
-    initAdc();
-    // Start Midi Communication
-    Midi::init();
-
-    // Configure Timers for output setting
-    cli();
-    TCCR1A = 0;
-    TCCR1B = _BV(WGM12) | _BV(CS11) | _BV(CS10); // divide 64 Prescaler
-    TCNT1 = 0;
-    sei();
-    set_sleep_mode(SLEEP_MODE_IDLE);
-
+    // Initialise modules
+    adc::init();
+    output::init(OUT_PIN);
+    midi::init();
     
-
     for(;;) {
         // Process midi messages  
         bool gotMessage = false;  
-        Midi::Message message = Midi::getMessage();
-        while (message.type != Midi::NONE) {
+        midi::Message message = midi::getMessage();
+        while (message.type != midi::NONE) {
             gotMessage = true;
             switch (message.type) {
-              case Midi::NOTE_ON:
+              case midi::NOTE_ON:
                 noteVelocities[message.pitch] = message.velocity;              
               break;
-              case Midi::NOTE_OFF:
+              case midi::NOTE_OFF:
                 noteVelocities[message.pitch] = 0;
               break;
-              case Midi::STOP:
-              case Midi::RESET:
-              case Midi::SOUND_OFF:
-              case Midi::NOTES_OFF:
-              case Midi:: CHAN_RESET:
+              case midi::STOP:
+              case midi::RESET:
+              case midi::SOUND_OFF:
+              case midi::NOTES_OFF:
+              case midi::CHAN_RESET:
                 for(uint8_t i=0; i<128; i++) {
                     noteVelocities[i] = 0;
                 }
@@ -97,12 +77,12 @@ void midiMode() {
               default:
                ;// TODO - Unhandled messages
             }
-            message = Midi::getMessage();
+            message = midi::getMessage();
         }
         
         // Get Knob Positions
-        uint16_t velocity = readAdc(VELOCITY_PIN);
-        uint16_t pitch = readAdc(PITCH_PIN);
+        uint16_t velocity = adc::get(VELOCITY_PIN);
+        uint16_t pitch = adc::get(PITCH_PIN);
 
         // Transpose
         uint8_t transpose;
@@ -121,62 +101,39 @@ void midiMode() {
         while ((noteVelocities[upperPitch]==0 || MIDI_PERIOD[upperPitch]*transpose < MIN_PERIOD) && upperPitch>=0 ) {
             upperPitch--;
         }
-        enableOut = velocity>10 && upperPitch >= 0;
+        enableOut = velocity>0 && upperPitch >= 0;
         
-        if (enableOut) {
-            periodOut = MIDI_PERIOD[upperPitch]*transpose;
-            ontimeOut = ((uint32_t)MIDI_ONTIME[noteVelocities[upperPitch]]*(velocity-10)*MAX_ONTIME)/1023/1013;
-            TIMSK1 = _BV(OCIE1A) | _BV(OCIE1B);
-        } 
+        // Set output
+        if (enableOut)
+        output::set(MIDI_PERIOD[upperPitch]*transpose, ((uint32_t)MIDI_ONTIME[noteVelocities[upperPitch]]*velocity*MAX_ONTIME)/1023/1023);
+        else 
+        output::set(1000,0);
     }
 }
 
 
 /* MANUAL MODE INTERRUPTER */
 void manualMode() {
-    initAdc();
-    // Configure Timers for output setting
-    cli();
-    TCCR1A = 0;
-    TCCR1B = _BV(WGM12) | _BV(CS11) | _BV(CS10); // divide 64 Prescaler
-    TCNT1 = 0;
-    sei();
-    set_sleep_mode(SLEEP_MODE_IDLE);
+    adc::init();
+    output::init(OUT_PIN);
 
     for(;;) {
-        _delay_ms(100);
+        _delay_ms(10);
         
-        uint16_t velocity = readAdc(VELOCITY_PIN);
-        uint16_t pitch = readAdc(PITCH_PIN);
+        uint32_t velocity = adc::get(VELOCITY_PIN);
+        uint32_t pitch = adc::get(PITCH_PIN);
 
-        enableOut = velocity>10;
-        if (enableOut) {
-            periodOut = MIN_PERIOD*1023UL/pitch - 1;
-            ontimeOut = MAX_ONTIME*(velocity-10UL)/1013;
-            TIMSK1 = _BV(OCIE1A) | _BV(OCIE1B);
-        }
+        output::set(MIN_PERIOD*1025UL/(pitch+2), MAX_ONTIME*velocity/1023UL);
     }
 }
 
-/* ISR ROUTINES */
-ISR(TIMER1_COMPB_vect) {
-    PORTD &= ~_BV(OUT_PIN);
-    if (!enableOut) TIMSK1 = 0;
-    OCR1A = F_CPU/1000000UL*periodOut/64;
-    OCR1B = F_CPU/1000000UL*ontimeOut/64;
-}
-
-ISR(TIMER1_COMPA_vect) {
-    PORTD |= _BV(OUT_PIN);
-}
-
-
+/* PROGRAM ENTRY POINT */
 int main() {
     // Configure Pins
     DDRD = _BV(OUT_PIN) | _BV(MODE_LED_PIN); 
 
     // Enter Routine
-    _delay_ms(100);
+    _delay_ms(10);
     if (PINC & _BV(MODE_SET_PIN)) {
         PORTD |= _BV(MODE_LED_PIN);
         midiMode();

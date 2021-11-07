@@ -5,10 +5,9 @@
 
 #include <util/setbaud.h>
 #include <avr/interrupt.h>
-#include <avr/io.h>
 #include <avr/sleep.h>
 
-namespace Midi 
+namespace midi 
 {
 
     /* MIDI BYTE RANGES */

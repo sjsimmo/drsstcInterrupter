@@ -3,7 +3,7 @@
 #ifndef MIDI_H
 #define MIDI_H
 
-namespace Midi
+namespace midi
 {
     enum MessageType {
         NONE,       // Incomplete midi message 
